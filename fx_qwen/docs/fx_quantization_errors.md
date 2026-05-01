@@ -436,3 +436,99 @@ with torch.no_grad():
 - Qwen2.5-0.5B / 3B での実測（HuggingFace へのアクセスが必要）
 - INT8量子化後の PPL 変化を `eval_ppl/eval_ppl.py` と組み合わせて評価
 - Static Quantization の Long dtype 問題の根本解決（カスタム Quantizer で dtype フィルタ追加）
+
+---
+
+# torch 2.11 での Static Quantization（torchao observer API）
+
+`prepare_pt2e` が torchao に移管されて未安定なため、`LinearActivationWeightObservedTensor` で代替。
+実装: `static_quantize_211.py`
+
+---
+
+## エラー⑪ — `LinearActivationWeightObservedTensor` が `aten.view` 未実装
+
+### 発生箇所
+
+```python
+quantize_(model, Int8StaticActivationInt8WeightConfig(act_quant_scale=...))
+```
+
+### エラー
+
+```
+NotImplementedError: LinearActivationWeightObservedTensor dispatch:
+attempting to run unimplemented operator/function: func=<OpOverload(op='aten.view')>
+```
+
+### 原因
+
+calibration 後に weight が `LinearActivationWeightObservedTensor` のまま残っており、
+`quantize_()` 内部の `aten.view` がこの型に対して未実装。
+
+### 対処法
+
+calibration 後に observer tensor を除去して float に戻す。
+
+```python
+for name, mod in model.named_modules():
+    if isinstance(mod, torch.nn.Linear):
+        if isinstance(mod.weight, LinearActivationWeightObservedTensor):
+            mod.weight = torch.nn.Parameter(
+                mod.weight.original_weight_tensor.detach().float()
+            )
+```
+
+---
+
+## エラー⑫ — `act_scale` の ndim / shape 不一致
+
+### 発生箇所
+
+`quantize_()` → 推論時の `Int8Tensor.from_hp`
+
+### エラー
+
+```
+AssertionError  (scale.ndim == hp_tensor.ndim)
+AssertionError  (hp_tensor.shape[i] // block_size[i]) == scale.shape[i]
+```
+
+### 原因
+
+activation tensor は 3D `(batch, seq, hidden)`。
+`act_quant_scale` は同じ ndim かつ各次元で `shape[i] == tensor.shape[i] // block_size[i]` を満たす必要がある。
+
+PerRow granularity の場合、block_size = `(1, 1, hidden)` なので:
+- `scale.shape` = `(batch, seq, 1)` = `(1, 16, 1)` が正解
+- `(1, 1, 1)` など誤った shape は assertion 失敗
+
+### 対処法
+
+`AffineQuantizedMinMaxObserver` を `keepdim=True` + `PerRow()` で作成する。
+observer の `calculate_qparams()` が `(1, seq, 1)` の scale を返す。
+
+```python
+act_obs = AffineQuantizedMinMaxObserver(
+    MappingType.SYMMETRIC, torch.int8,
+    granularity=PerRow(), keepdim=True,
+)
+```
+
+---
+
+## torch 2.11 Static Quantization の最終構成
+
+```
+insert_observers()    → LinearActivationWeightObservedTensor で Linear 層をラップ
+calibrate()           → 固定 seq_len でデータを流す（act_scale を収集）
+remove_observers()    → weight を float に戻す（observer tensor 除去）
+quantize_()           → Int8StaticActivationInt8WeightConfig(act_quant_scale=scale)
+inference             → logits shape [1, 16, 5000], 32.9ms ✅
+```
+
+### 制約
+
+- **seq_len が固定**でなければならない（act_scale の shape が seq_len に依存）
+- Dynamic Quantization (`Int8DynamicActivationInt8WeightConfig`) は seq_len 自由
+- `Int8StaticActivationInt8WeightConfig` v1 は torchao 0.17 時点で実験的
