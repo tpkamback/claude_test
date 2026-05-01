@@ -1,504 +1,316 @@
 """
-static_quantize_attn_211.py — Attention + RMSNorm + SiLU + Softmax + RoPE の
-                               Static Fake Quantization（torch 2.11 / forward hook 方式）
+static_quantize_attn_211.py — Full Static Quantization
+  (nn.Linear + Attn matmul + RMSNorm + SiLU + Softmax + RoPE)
 
-量子化対象:
-  - Attention matmul  （QK^T, AV の両 matmul 入力）
-  - RMSNorm           （Qwen2RMSNorm の入力）
-  - SiLU              （Qwen2MLP の act_fn 入力）
-  - Softmax           （attn_weights → 確率変換の入力）
-  - RoPE              （apply_rotary_pos_emb の q/k 入力）
+Quantization targets:
+  1. nn.Linear (169 layers)     - static_quantize_211.py logic (torchao)
+  2. Attention matmul           - Q@K^T and attn_weights@V (fake quant on inputs)
+  3. RMSNorm (Qwen2RMSNorm)     - fake quant on input
+  4. SiLU                       - fake quant on input
+  5. Softmax                    - fake quant on attn_weights before softmax
+  6. RoPE (RotaryEmbedding)     - fake quant on x input
 
-量子化方式: Fake Quantization（対称 int8）
-  入力テンソルを int8 に量子化 → float に逆量子化 → 演算を実行
-  calibration フェーズで per-tensor abs-max から静的 scale を収集する。
+Fake quantization = quantize_affine (int8) -> dequantize_affine (float) -> original op.
 
 Usage:
     python static_quantize_attn_211.py
-    python static_quantize_attn_211.py --model ../eval_ppl/models/qwen2-tiny \\
-        --seq_len 16 --n_calib 4
+    python static_quantize_attn_211.py --model ../eval_ppl/models/Qwen2.5-0.5B-random --seq_len 16
 """
 
 import argparse
 import time
-from collections import defaultdict
-from typing import Dict, List, Optional
+import types
+import warnings
+
+warnings.filterwarnings("ignore")
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from transformers import AutoModelForCausalLM
 from transformers.models.qwen2.modeling_qwen2 import (
-    Qwen2RMSNorm,
-    Qwen2MLP,
     Qwen2Attention,
+    Qwen2RMSNorm,
+    Qwen2RotaryEmbedding,
     apply_rotary_pos_emb,
-    eager_attention_forward,
+    repeat_kv,
+)
+from torchao.quantization import (
+    AffineQuantizedMinMaxObserver,
+    MappingType,
+)
+from torchao.quantization.granularity import PerTensor
+from torchao.quantization.quant_primitives import quantize_affine, dequantize_affine
+
+# Import Linear-only pipeline from the existing module
+from static_quantize_211 import (
+    insert_observers,
+    calibrate as calibrate_linear,
+    remove_observers,
+    apply_static_quant,
 )
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Fake Quantization ユーティリティ
+# Helper: per-tensor symmetric fake quantization via torchao API
 # ─────────────────────────────────────────────────────────────────────────────
 
-INT8_MAX = 127.0
-
-
-def compute_scale(tensor: torch.Tensor) -> torch.Tensor:
-    """
-    対称量子化の per-tensor scale を計算する。
-      scale = abs_max / INT8_MAX
-    ゼロ除算を避けるため eps を加算する。
-    """
-    return tensor.abs().max().clamp(min=1e-8) / INT8_MAX
-
-
-def fake_quantize(tensor: torch.Tensor, scale: torch.Tensor) -> torch.Tensor:
-    """
-    Fake Quantization:
-      q = clamp(round(x / scale), -127, 127)   # quantize → int8 相当
-      x̂ = q * scale                             # dequantize → float
-    勾配は straight-through estimator で通過する（推論専用なので不要だが一貫性のため）。
-    """
-    q = torch.clamp(torch.round(tensor / scale), -INT8_MAX, INT8_MAX)
-    return q * scale
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# キャリブレーション統計コレクター
-# ─────────────────────────────────────────────────────────────────────────────
-
-class CalibStats:
-    """
-    キャリブレーション中に abs_max を running-max で蓄積し、
-    最終的な静的 scale を保持する。
-    """
-
-    def __init__(self, name: str, kind: str):
-        self.name = name          # モジュール名 or 識別子
-        self.kind = kind          # "rmsnorm" / "silu" / "softmax" / "rope_q" / "rope_k" / "attn_qk" / "attn_av"
-        self.running_max: Optional[torch.Tensor] = None
-        self.scale: Optional[torch.Tensor] = None
-        self.n_samples = 0
-
-    def update(self, tensor: torch.Tensor):
-        val = tensor.detach().abs().max()
-        if self.running_max is None:
-            self.running_max = val.clone()
-        else:
-            self.running_max = torch.max(self.running_max, val)
-        self.n_samples += 1
-
-    def finalize(self):
-        if self.running_max is not None:
-            self.scale = self.running_max.clamp(min=1e-8) / INT8_MAX
-        else:
-            self.scale = torch.tensor(1.0 / INT8_MAX)
+def fake_quantize_int8(x: torch.Tensor) -> torch.Tensor:
+    """Per-tensor symmetric fake-quantization to int8 using torchao primitives."""
+    orig_dtype = x.dtype
+    x_f = x.float()
+    amax = x_f.abs().max()
+    if amax == 0:
+        return x
+    scale = (amax / 127.0).reshape(1)
+    zero_point = torch.zeros(1, dtype=torch.int32, device=x.device)
+    block_size = tuple(x_f.shape)
+    q = quantize_affine(
+        x_f,
+        block_size=block_size,
+        scale=scale,
+        zero_point=zero_point,
+        output_dtype=torch.int8,
+        quant_min=-128,
+        quant_max=127,
+    )
+    dq = dequantize_affine(
+        q,
+        block_size=block_size,
+        scale=scale,
+        zero_point=zero_point,
+        input_dtype=torch.int8,
+        quant_min=-128,
+        quant_max=127,
+        output_dtype=torch.float32,
+    )
+    return dq.to(orig_dtype)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Hook ハンドラ群
+# Attention calibration observers
 # ─────────────────────────────────────────────────────────────────────────────
 
-def make_rmsnorm_hook(stats: CalibStats):
+def insert_attn_observers(model: nn.Module):
     """
-    Qwen2RMSNorm の forward hook。
-    入力 hidden_states の abs-max を蓄積する（calibration フェーズのみ統計収集）。
+    Register a forward pre-hook (with_kwargs=True) on each Qwen2Attention.
+    Collects min/max for Q, K_expanded, attn_weights (post-softmax), V_expanded.
+    Returns (attn_observers, handles).
     """
-    def hook(module, args, kwargs):
-        x = args[0] if args else kwargs.get("hidden_states")
-        if x is not None:
-            stats.update(x)
-        return None  # 入力変更なし（calibration のみ）
-    return hook
+    attn_observers = {}
+    handles = []
 
+    for name, mod in model.named_modules():
+        if not isinstance(mod, Qwen2Attention):
+            continue
 
-def make_rmsnorm_fake_quant_hook(stats: CalibStats):
-    """
-    Qwen2RMSNorm の forward pre-hook（量子化フェーズ）。
-    入力を fake quantize して返す。
-    """
-    def hook(module, args, kwargs):
-        x = args[0] if args else kwargs.get("hidden_states")
-        if x is not None and stats.scale is not None:
-            x_fq = fake_quantize(x, stats.scale.to(x.device))
-            if args:
-                return (x_fq, *args[1:]), kwargs
-            else:
-                kwargs["hidden_states"] = x_fq
-                return args, kwargs
-        return None
-    return hook
+        obs_q = AffineQuantizedMinMaxObserver(
+            MappingType.SYMMETRIC, torch.int8, granularity=PerTensor(), keepdim=True)
+        obs_k = AffineQuantizedMinMaxObserver(
+            MappingType.SYMMETRIC, torch.int8, granularity=PerTensor(), keepdim=True)
+        obs_a = AffineQuantizedMinMaxObserver(
+            MappingType.SYMMETRIC, torch.int8, granularity=PerTensor(), keepdim=True)
+        obs_v = AffineQuantizedMinMaxObserver(
+            MappingType.SYMMETRIC, torch.int8, granularity=PerTensor(), keepdim=True)
+        attn_observers[name] = {"q": obs_q, "k": obs_k, "a": obs_a, "v": obs_v}
 
+        def make_hook(oq, ok, oa, ov):
+            def hook(module, args, kwargs):
+                hidden_states = kwargs.get("hidden_states")
+                position_embeddings = kwargs.get("position_embeddings")
+                if hidden_states is None or position_embeddings is None:
+                    return
+                cos, sin = position_embeddings
+                input_shape = hidden_states.shape[:-1]
+                hidden_shape = (*input_shape, -1, module.head_dim)
+                with torch.no_grad():
+                    q = module.q_proj(hidden_states).view(hidden_shape).transpose(1, 2)
+                    k = module.k_proj(hidden_states).view(hidden_shape).transpose(1, 2)
+                    v = module.v_proj(hidden_states).view(hidden_shape).transpose(1, 2)
+                    q, k = apply_rotary_pos_emb(q, k, cos, sin)
+                    k_exp = repeat_kv(k, module.num_key_value_groups)
+                    v_exp = repeat_kv(v, module.num_key_value_groups)
+                    scaling = module.head_dim ** -0.5
+                    raw_scores = torch.matmul(q, k_exp.transpose(-2, -1)) * scaling
+                    attn_w = F.softmax(raw_scores, dim=-1, dtype=torch.float32).to(q.dtype)
+                    oq(q)
+                    ok(k_exp)
+                    oa(attn_w)
+                    ov(v_exp)
+            return hook
 
-def make_silu_hook(stats: CalibStats):
-    """
-    Qwen2MLP.act_fn（SiLU）を monkey-patch するためのラッパークラス用統計収集 hook。
-    act_fn は nn.Module ではなく callable なため、MLP 自体の hook から対処する。
-    """
-    def hook(module, args, kwargs):
-        # MLP forward の入力 x の統計を収集
-        x = args[0] if args else kwargs.get("x")
-        if x is not None:
-            stats.update(x)
-        return None
-    return hook
+        h = mod.register_forward_pre_hook(
+            make_hook(obs_q, obs_k, obs_a, obs_v), with_kwargs=True)
+        handles.append(h)
 
-
-def make_mlp_fake_quant_hook(stats: CalibStats):
-    """
-    Qwen2MLP の forward pre-hook（量子化フェーズ）。
-    gate_proj に渡す入力（= act_fn の入力に対応）を fake quantize する。
-    SiLU の実際の入力は gate_proj(x) だが、ここでは act_fn 直前の入力 x を量子化する。
-    """
-    def hook(module, args, kwargs):
-        x = args[0] if args else kwargs.get("x")
-        if x is not None and stats.scale is not None:
-            x_fq = fake_quantize(x, stats.scale.to(x.device))
-            if args:
-                return (x_fq, *args[1:]), kwargs
-            else:
-                kwargs["x"] = x_fq
-                return args, kwargs
-        return None
-    return hook
-
-
-class FakeQuantSoftmax(nn.Module):
-    """
-    Softmax の入力（attn_weights logits）を fake quantize してから
-    通常の softmax を適用するラッパーモジュール。
-    calibration フェーズでは統計のみ収集。
-    """
-
-    def __init__(self, stats: CalibStats):
-        super().__init__()
-        self.stats = stats
-        self.calibrating = True
-
-    def forward(self, attn_weights: torch.Tensor, dim: int = -1, dtype=None) -> torch.Tensor:
-        if self.calibrating:
-            self.stats.update(attn_weights)
-        elif self.stats.scale is not None:
-            attn_weights = fake_quantize(attn_weights, self.stats.scale.to(attn_weights.device))
-        return F.softmax(attn_weights, dim=dim, dtype=dtype)
-
-
-class FakeQuantRoPE:
-    """
-    apply_rotary_pos_emb を差し替えるための callable ラッパー。
-    q, k の両テンソルそれぞれの abs-max を収集し、fake quantize する。
-    """
-
-    def __init__(self, stats_q: CalibStats, stats_k: CalibStats):
-        self.stats_q = stats_q
-        self.stats_k = stats_k
-        self.calibrating = True
-
-    def __call__(self, q, k, cos, sin, unsqueeze_dim=1):
-        if self.calibrating:
-            self.stats_q.update(q)
-            self.stats_k.update(k)
-        else:
-            if self.stats_q.scale is not None:
-                q = fake_quantize(q, self.stats_q.scale.to(q.device))
-            if self.stats_k.scale is not None:
-                k = fake_quantize(k, self.stats_k.scale.to(k.device))
-        # 元の apply_rotary_pos_emb ロジックをインライン実行
-        cos = cos.unsqueeze(unsqueeze_dim)
-        sin = sin.unsqueeze(unsqueeze_dim)
-        q_embed = (q * cos) + (_rotate_half(q) * sin)
-        k_embed = (k * cos) + (_rotate_half(k) * sin)
-        return q_embed, k_embed
-
-
-def _rotate_half(x: torch.Tensor) -> torch.Tensor:
-    x1 = x[..., : x.shape[-1] // 2]
-    x2 = x[..., x.shape[-1] // 2 :]
-    return torch.cat((-x2, x1), dim=-1)
-
-
-class FakeQuantAttnForward:
-    """
-    eager_attention_forward を差し替えるための callable ラッパー。
-    QK matmul の入力（query, key_states）と
-    AV matmul の入力（attn_weights, value_states）をそれぞれ fake quantize する。
-    Softmax は FakeQuantSoftmax で処理済みなので attn_weights はすでに fake quantized。
-    """
-
-    def __init__(self, stats_qk: CalibStats, stats_av: CalibStats,
-                 softmax_wrapper: FakeQuantSoftmax):
-        self.stats_qk = stats_qk
-        self.stats_av = stats_av
-        self.softmax_wrapper = softmax_wrapper
-        self.calibrating = True
-
-    def __call__(self, module, query, key, value, attention_mask, scaling,
-                 dropout=0.0, **kwargs):
-        from transformers.models.qwen2.modeling_qwen2 import repeat_kv
-
-        key_states = repeat_kv(key, module.num_key_value_groups)
-        value_states = repeat_kv(value, module.num_key_value_groups)
-
-        # QK matmul の入力を fake quantize（calibration 時は統計収集のみ）
-        if self.calibrating:
-            self.stats_qk.update(query)
-            self.stats_qk.update(key_states)
-        else:
-            if self.stats_qk.scale is not None:
-                scale_qk = self.stats_qk.scale.to(query.device)
-                query = fake_quantize(query, scale_qk)
-                key_states = fake_quantize(key_states, scale_qk)
-
-        attn_weights = torch.matmul(query, key_states.transpose(2, 3)) * scaling
-        if attention_mask is not None:
-            attn_weights = attn_weights + attention_mask
-
-        # Softmax（FakeQuantSoftmax で fake quantize 済み）
-        attn_weights = self.softmax_wrapper(attn_weights, dim=-1, dtype=torch.float32)
-        attn_weights = attn_weights.to(query.dtype)
-        attn_weights = F.dropout(attn_weights, p=dropout, training=module.training)
-
-        # AV matmul の入力を fake quantize
-        if self.calibrating:
-            self.stats_av.update(attn_weights)
-            self.stats_av.update(value_states)
-        else:
-            if self.stats_av.scale is not None:
-                scale_av = self.stats_av.scale.to(attn_weights.device)
-                attn_weights = fake_quantize(attn_weights, scale_av)
-                value_states = fake_quantize(value_states, scale_av)
-
-        attn_output = torch.matmul(attn_weights, value_states)
-        attn_output = attn_output.transpose(1, 2).contiguous()
-
-        return attn_output, attn_weights
+    return attn_observers, handles
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# メイン量子化インストルメンテーション
+# Apply quantization: Attention matmuls
 # ─────────────────────────────────────────────────────────────────────────────
 
-class FakeQuantInstrument:
+def _quant_dequant(t: torch.Tensor, scale: torch.Tensor, zp: torch.Tensor) -> torch.Tensor:
+    bs = tuple(t.shape)
+    t_int8 = quantize_affine(t, bs, scale, zp, torch.int8)
+    return dequantize_affine(t_int8, bs, scale, zp, torch.int8, output_dtype=torch.float32)
+
+
+def apply_attn_quant(model: nn.Module, attn_observers: dict) -> int:
     """
-    モデル全体に fake quantization フック / ラッパーを設置し、
-    calibration → finalize → 量子化推論の状態遷移を管理する。
+    Patch each Qwen2Attention.forward to fake-quantize:
+      Q and K before Q@K^T, attn_weights and V before attn@V.
     """
+    n_patched = 0
 
-    def __init__(self):
-        self.all_stats: Dict[str, CalibStats] = {}
-        self._hooks: List[torch.utils.hooks.RemovableHook] = []
-        # 置き換えた関数を後で参照するためのリスト
-        self._softmax_wrappers: List[FakeQuantSoftmax] = []
-        self._rope_wrappers: List[FakeQuantRoPE] = []
-        self._attn_wrappers: List[FakeQuantAttnForward] = []
+    for name, mod in model.named_modules():
+        if not isinstance(mod, Qwen2Attention):
+            continue
+        if name not in attn_observers:
+            continue
 
-    # ── 統計登録ヘルパー ─────────────────────────────────────────────────────
+        obs = attn_observers[name]
+        sq, zq = obs["q"].calculate_qparams()
+        sk, zk = obs["k"].calculate_qparams()
+        sa, za = obs["a"].calculate_qparams()
+        sv, zv = obs["v"].calculate_qparams()
+        zq = zq.to(torch.int32)
+        zk = zk.to(torch.int32)
+        za = za.to(torch.int32)
+        zv = zv.to(torch.int32)
 
-    def _new_stats(self, name: str, kind: str) -> CalibStats:
-        stats = CalibStats(name, kind)
-        self.all_stats[f"{name}::{kind}"] = stats
-        return stats
+        def make_patched_forward(the_mod, sq_, zq_, sk_, zk_, sa_, za_, sv_, zv_):
+            def patched_forward(
+                hidden_states,
+                position_embeddings,
+                attention_mask,
+                past_key_values=None,
+                **kwargs,
+            ):
+                input_shape = hidden_states.shape[:-1]
+                hidden_shape = (*input_shape, -1, the_mod.head_dim)
 
-    # ── インストルメンテーション ─────────────────────────────────────────────
+                q = the_mod.q_proj(hidden_states).view(hidden_shape).transpose(1, 2)
+                k = the_mod.k_proj(hidden_states).view(hidden_shape).transpose(1, 2)
+                v = the_mod.v_proj(hidden_states).view(hidden_shape).transpose(1, 2)
 
-    def instrument(self, model: nn.Module):
-        """
-        モデルの各モジュールに対してキャリブレーション統計収集 hook を設置し、
-        FakeQuant ラッパーを差し込む。
-        """
-        for name, mod in model.named_modules():
+                cos, sin = position_embeddings
+                q, k = apply_rotary_pos_emb(q, k, cos, sin)
 
-            # ── RMSNorm ────────────────────────────────────────────────────
-            if isinstance(mod, Qwen2RMSNorm):
-                stats = self._new_stats(name, "rmsnorm")
-                h = mod.register_forward_pre_hook(
-                    make_rmsnorm_hook(stats), with_kwargs=True
-                )
-                self._hooks.append(h)
+                if past_key_values is not None:
+                    k, v = past_key_values.update(k, v, the_mod.layer_idx)
 
-            # ── SiLU（MLP 単位で入力を量子化）────────────────────────────
-            elif isinstance(mod, Qwen2MLP):
-                stats = self._new_stats(name, "silu")
-                h = mod.register_forward_pre_hook(
-                    make_silu_hook(stats), with_kwargs=True
-                )
-                self._hooks.append(h)
+                k_exp = repeat_kv(k, the_mod.num_key_value_groups)
+                v_exp = repeat_kv(v, the_mod.num_key_value_groups)
 
-            # ── Attention（Softmax / RoPE / matmul を内包） ───────────────
-            elif isinstance(mod, Qwen2Attention):
-                # Softmax wrapper
-                stats_sm = self._new_stats(name, "softmax")
-                softmax_wrapper = FakeQuantSoftmax(stats_sm)
-                self._softmax_wrappers.append(softmax_wrapper)
+                scaling = the_mod.head_dim ** -0.5
 
-                # RoPE wrapper
-                stats_rq = self._new_stats(name, "rope_q")
-                stats_rk = self._new_stats(name, "rope_k")
-                rope_wrapper = FakeQuantRoPE(stats_rq, stats_rk)
-                self._rope_wrappers.append(rope_wrapper)
+                # Q @ K^T with int8 fake quantization
+                q_dq = _quant_dequant(q,     sq_, zq_)
+                k_dq = _quant_dequant(k_exp, sk_, zk_)
+                attn_weights = torch.matmul(q_dq, k_dq.transpose(-2, -1)) * scaling
 
-                # Attn matmul wrapper
-                stats_qk = self._new_stats(name, "attn_qk")
-                stats_av = self._new_stats(name, "attn_av")
-                attn_wrapper = FakeQuantAttnForward(stats_qk, stats_av, softmax_wrapper)
-                self._attn_wrappers.append(attn_wrapper)
+                if attention_mask is not None:
+                    attn_weights = attn_weights + attention_mask
 
-                # Attention モジュールに wrapper を注入
-                # （forward 内で参照されるように属性として保持）
-                mod._fq_rope = rope_wrapper
-                mod._fq_attn = attn_wrapper
+                # Softmax: fake-quant attn_weights before softmax
+                attn_weights = fake_quantize_int8(attn_weights)
+                attn_weights = F.softmax(attn_weights, dim=-1, dtype=torch.float32)
 
-                # forward を monkey-patch
-                _patch_attention_forward(mod)
+                # attn_weights @ V with int8 fake quantization
+                a_dq = _quant_dequant(attn_weights, sa_, za_)
+                v_dq = _quant_dequant(v_exp,        sv_, zv_)
+                attn_output = torch.matmul(a_dq, v_dq)
 
-        n = {
-            "rmsnorm": sum(1 for s in self.all_stats.values() if s.kind == "rmsnorm"),
-            "silu":    sum(1 for s in self.all_stats.values() if s.kind == "silu"),
-            "softmax": sum(1 for s in self.all_stats.values() if s.kind == "softmax"),
-            "rope":    sum(1 for s in self.all_stats.values() if s.kind in ("rope_q", "rope_k")) // 2,
-            "attn_matmul": sum(1 for s in self.all_stats.values() if s.kind == "attn_qk"),
-        }
-        return n
+                attn_output = attn_output.transpose(1, 2).contiguous()
+                attn_output = attn_output.reshape(*input_shape, -1).contiguous()
+                attn_output = the_mod.o_proj(attn_output)
+                return attn_output, None
 
-    # ── calibration 終了後に scale を確定 ────────────────────────────────────
+            return patched_forward
 
-    def finalize_calibration(self):
-        """
-        全 CalibStats を finalize（scale を確定）し、
-        全 wrapper / hook を「量子化モード」に切り替える。
-        """
-        for stats in self.all_stats.values():
-            stats.finalize()
+        mod.forward = make_patched_forward(mod, sq, zq, sk, zk, sa, za, sv, zv)
+        n_patched += 1
 
-        # calibrating フラグを False に切り替え
-        for sw in self._softmax_wrappers:
-            sw.calibrating = False
-        for rw in self._rope_wrappers:
-            rw.calibrating = False
-        for aw in self._attn_wrappers:
-            aw.calibrating = False
-
-        # RMSNorm / SiLU hook を fake-quant hook に差し替え
-        for h in self._hooks:
-            h.remove()
-        self._hooks.clear()
-
-        # 収集完了後、fake quant hook を再登録
-        for key, stats in self.all_stats.items():
-            mod_name = key.split("::")[0]
-            kind = stats.kind
-            mod = _get_module(self._model_ref, mod_name)
-            if mod is None:
-                continue
-            if kind == "rmsnorm":
-                h = mod.register_forward_pre_hook(
-                    make_rmsnorm_fake_quant_hook(stats), with_kwargs=True
-                )
-                self._hooks.append(h)
-            elif kind == "silu":
-                h = mod.register_forward_pre_hook(
-                    make_mlp_fake_quant_hook(stats), with_kwargs=True
-                )
-                self._hooks.append(h)
-
-    def set_model_ref(self, model: nn.Module):
-        self._model_ref = model
-
-    def scale_summary(self) -> Dict[str, Dict]:
-        """各種量子化の scale 統計をまとめて返す。"""
-        summary = defaultdict(list)
-        for key, stats in self.all_stats.items():
-            if stats.scale is not None:
-                summary[stats.kind].append(stats.scale.item())
-        result = {}
-        for kind, scales in summary.items():
-            arr = torch.tensor(scales)
-            result[kind] = {
-                "count": len(scales),
-                "min": arr.min().item(),
-                "max": arr.max().item(),
-                "mean": arr.mean().item(),
-            }
-        return result
+    return n_patched
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Attention forward monkey-patch
+# Apply quantization: RMSNorm, SiLU, RoPE
 # ─────────────────────────────────────────────────────────────────────────────
 
-def _patch_attention_forward(attn_mod: Qwen2Attention):
-    """
-    Qwen2Attention.forward を差し替えて、
-    _fq_rope / _fq_attn ラッパーを呼ぶようにする。
-    """
-    import types
-    from transformers.models.qwen2.modeling_qwen2 import Qwen2Attention as _Qwen2Attn
-    from transformers.integrations.sdpa_attention import sdpa_attention_forward
+def apply_rmsnorm_quant(model: nn.Module) -> int:
+    """Patch Qwen2RMSNorm.forward to fake-quantize input."""
+    orig_forward = Qwen2RMSNorm.forward
+    count = 0
 
-    def patched_forward(
-        self,
-        hidden_states,
-        position_embeddings,
-        attention_mask,
-        past_key_values=None,
-        **kwargs,
-    ):
-        input_shape = hidden_states.shape[:-1]
-        hidden_shape = (*input_shape, -1, self.head_dim)
+    def quantized_forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        hidden_states = fake_quantize_int8(hidden_states)
+        return orig_forward(self, hidden_states)
 
-        query_states = self.q_proj(hidden_states).view(hidden_shape).transpose(1, 2)
-        key_states = self.k_proj(hidden_states).view(hidden_shape).transpose(1, 2)
-        value_states = self.v_proj(hidden_states).view(hidden_shape).transpose(1, 2)
+    for name, mod in model.named_modules():
+        if isinstance(mod, Qwen2RMSNorm):
+            mod.forward = types.MethodType(quantized_forward, mod)
+            count += 1
+    return count
 
-        cos, sin = position_embeddings
 
-        # RoPE を fake-quant ラッパー経由で適用
-        query_states, key_states = self._fq_rope(query_states, key_states, cos, sin)
+def apply_silu_quant(model: nn.Module) -> int:
+    """Patch SiLUActivation.forward to fake-quantize input."""
+    count = 0
 
-        if past_key_values is not None:
-            key_states, value_states = past_key_values.update(
-                key_states, value_states, self.layer_idx
-            )
+    def quantized_forward(self, x: torch.Tensor) -> torch.Tensor:
+        x = fake_quantize_int8(x)
+        return F.silu(x)
 
-        # attention matmul + softmax を fake-quant ラッパー経由で実行
-        attn_output, attn_weights = self._fq_attn(
-            self,
-            query_states,
-            key_states,
-            value_states,
-            attention_mask,
-            dropout=0.0 if not self.training else self.attention_dropout,
-            scaling=self.scaling,
+    for name, mod in model.named_modules():
+        if "SiLU" in type(mod).__name__:
+            mod.forward = types.MethodType(quantized_forward, mod)
+            count += 1
+    return count
+
+
+def apply_rope_quant(model: nn.Module) -> int:
+    """Patch Qwen2RotaryEmbedding.forward to fake-quantize x input."""
+    count = 0
+
+    def quantized_forward(self, x: torch.Tensor, position_ids: torch.Tensor):
+        x = fake_quantize_int8(x)
+        inv_freq_expanded = (
+            self.inv_freq[None, :, None]
+            .float()
+            .expand(position_ids.shape[0], -1, 1)
+            .to(x.device)
         )
+        position_ids_expanded = position_ids[:, None, :].float()
+        device_type = (
+            x.device.type
+            if isinstance(x.device.type, str) and x.device.type != "mps"
+            else "cpu"
+        )
+        with torch.autocast(device_type=device_type, enabled=False):
+            freqs = (
+                inv_freq_expanded.float() @ position_ids_expanded.float()
+            ).transpose(1, 2)
+            emb = torch.cat((freqs, freqs), dim=-1)
+            cos = emb.cos() * self.attention_scaling
+            sin = emb.sin() * self.attention_scaling
+        return cos.to(dtype=x.dtype), sin.to(dtype=x.dtype)
 
-        attn_output = attn_output.reshape(*input_shape, -1).contiguous()
-        attn_output = self.o_proj(attn_output)
-        return attn_output, attn_weights
-
-    attn_mod.forward = types.MethodType(patched_forward, attn_mod)
-
-
-def _get_module(model: nn.Module, name: str) -> Optional[nn.Module]:
-    """ドット区切りのモジュール名からサブモジュールを返す。"""
-    parts = name.split(".")
-    mod = model
-    for p in parts:
-        if p == "":
-            return mod
-        if not hasattr(mod, p):
-            return None
-        mod = getattr(mod, p)
-    return mod
+    for name, mod in model.named_modules():
+        if isinstance(mod, Qwen2RotaryEmbedding):
+            mod.forward = types.MethodType(quantized_forward, mod)
+            count += 1
+    return count
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Pipeline
+# Argument parsing
 # ─────────────────────────────────────────────────────────────────────────────
 
 def parse_args():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--model", default="../eval_ppl/models/qwen2-tiny")
+    parser.add_argument("--model", default="../eval_ppl/models/Qwen2.5-0.5B-random")
     parser.add_argument("--seq_len", type=int, default=16,
                         help="Sequence length (fixed for static quant)")
     parser.add_argument("--n_calib", type=int, default=4,
@@ -506,73 +318,73 @@ def parse_args():
     return parser.parse_args()
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# Main
+# ─────────────────────────────────────────────────────────────────────────────
+
 def main():
     args = parse_args()
 
-    # ── [1/4] Load ────────────────────────────────────────────────────────────
-    print(f"[1/4] Loading: {args.model}")
+    # [1/5] Load
+    print(f"[1/5] Loading {args.model} ...")
     model = AutoModelForCausalLM.from_pretrained(args.model, dtype=torch.float32)
     model.eval()
     params = sum(p.numel() for p in model.parameters()) / 1e6
     print(f"      {params:.2f}M params")
 
-    # ── [2/4] Instrument ──────────────────────────────────────────────────────
-    print("[2/4] Instrumenting fake-quant hooks ...")
-    instrument = FakeQuantInstrument()
-    instrument.set_model_ref(model)
-    counts = instrument.instrument(model)
-    print(f"      RMSNorm      : {counts['rmsnorm']:3d} layers")
-    print(f"      SiLU (MLP)   : {counts['silu']:3d} layers")
-    print(f"      Softmax      : {counts['softmax']:3d} layers")
-    print(f"      RoPE         : {counts['rope']:3d} layers")
-    print(f"      Attn matmul  : {counts['attn_matmul']:3d} layers")
+    # [2/5] Insert observers
+    print("[2/5] Inserting observers (Linear / Attn / RMSNorm / SiLU / Softmax / RoPE) ...")
+    linear_observers = insert_observers(model)
+    attn_observers, attn_hooks = insert_attn_observers(model)
+    rmsnorm_count = sum(1 for _, m in model.named_modules() if isinstance(m, Qwen2RMSNorm))
+    silu_count = sum(1 for _, m in model.named_modules() if "SiLU" in type(m).__name__)
+    rope_count = sum(1 for _, m in model.named_modules() if isinstance(m, Qwen2RotaryEmbedding))
+    print(f"      Linear   : {len(linear_observers)} layers")
+    print(f"      Attention: {len(attn_observers)} layers")
+    print(f"      RMSNorm  : {rmsnorm_count} layers")
+    print(f"      SiLU     : {silu_count} layers")
+    print(f"      RoPE     : {rope_count} layers")
 
-    # ── [3/4] Calibration ─────────────────────────────────────────────────────
-    print(f"[3/4] Calibrating ({args.n_calib} samples, seq_len={args.seq_len}) ...")
-    with torch.no_grad():
-        for i in range(args.n_calib):
-            dummy = torch.randint(0, 100, (1, args.seq_len))
-            model(dummy, use_cache=False)
-            print(f"      sample {i + 1}/{args.n_calib} done")
+    # [3/5] Calibrate
+    print(f"[3/5] Calibrating ({args.n_calib} samples, seq_len={args.seq_len}) ...")
+    calibrate_linear(model, args.seq_len, args.n_calib)
+    print("      done")
 
-    instrument.finalize_calibration()
-    print("      Calibration finalized. Scale summary:")
-    summary = instrument.scale_summary()
-    kind_labels = {
-        "rmsnorm":  "RMSNorm input",
-        "silu":     "SiLU input (MLP x)",
-        "softmax":  "Softmax input (attn logits)",
-        "rope_q":   "RoPE query input",
-        "rope_k":   "RoPE key input",
-        "attn_qk":  "Attn QK matmul input",
-        "attn_av":  "Attn AV matmul input",
-    }
-    for kind, info in summary.items():
-        label = kind_labels.get(kind, kind)
-        print(f"        {label:30s} count={info['count']:3d}  "
-              f"scale=[{info['min']:.4f}, {info['max']:.4f}]  mean={info['mean']:.4f}")
+    # [4/5] Remove observers
+    print("[4/5] Removing observers ...")
+    for h in attn_hooks:
+        h.remove()
+    remove_observers(model)
+    print("      done")
 
-    # ── [4/4] Fake-quant inference ────────────────────────────────────────────
-    print("[4/4] Running fake-quant inference ...")
+    # [5/5] Apply quantization
+    print("[5/5] Applying quantization ...")
+    apply_static_quant(model, linear_observers)
+    n_attn = apply_attn_quant(model, attn_observers)
+    n_rmsnorm = apply_rmsnorm_quant(model)
+    n_silu = apply_silu_quant(model)
+    n_rope = apply_rope_quant(model)
+    # softmax is inside each attention block (one per block)
+    n_softmax = n_attn
+
+    print()
+    print(f"  Linear     : {len(linear_observers)} layers")
+    print(f"  Attn matmul:  {n_attn * 2} layers (Q@K^T, attn@V)")
+    print(f"  RMSNorm    :  {n_rmsnorm} layers")
+    print(f"  SiLU       :  {n_silu} layers")
+    print(f"  Softmax    :  {n_softmax} layers")
+    print(f"  RoPE       :  {n_rope} layers")
+
+    # Inference check
     dummy = torch.zeros(1, args.seq_len, dtype=torch.long)
     t0 = time.perf_counter()
     with torch.no_grad():
         out = model(dummy, use_cache=False)
     elapsed = (time.perf_counter() - t0) * 1000
 
-    print(f"\n  Logits : {out.logits.shape}")
+    print()
+    print(f"  Logits : {out.logits.shape}")
     print(f"  Time   : {elapsed:.1f} ms")
-
-    total_quant_layers = sum(counts.values())
-    print(f"\n  Quantized layer summary:")
-    print(f"    RMSNorm      : {counts['rmsnorm']:3d}")
-    print(f"    SiLU (MLP)   : {counts['silu']:3d}")
-    print(f"    Softmax      : {counts['softmax']:3d}")
-    print(f"    RoPE         : {counts['rope']:3d}")
-    print(f"    Attn matmul  : {counts['attn_matmul']:3d}")
-    print(f"    ─────────────────")
-    print(f"    Total        : {total_quant_layers:3d}")
-
     print(f"\nAll steps succeeded on torch {torch.__version__}")
 
 
