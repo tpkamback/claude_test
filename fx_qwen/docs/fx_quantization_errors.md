@@ -228,8 +228,211 @@ with torch.no_grad():
 
 ---
 
+---
+
+# torch 2.2.1 での PT2E パイプライン
+
+torch 2.2.1 + transformers 4.44.0 で `prepare_pt2e` / `convert_pt2e` を使った場合のエラーと対処。
+実装: `pt2e_quantize_221.py`
+
+---
+
+## エラー⑥ — `torch.compiler.is_compiling` が未実装（2.2.1）
+
+### 発生箇所
+
+```python
+torch.export.export(NoCacheWrapper(model), example)
+```
+
+### エラー
+
+```
+InternalTorchDynamoError: is_compiling
+...
+transformers/utils/import_utils.py: return torch.compiler.is_compiling()
+```
+
+### 原因
+
+transformers 4.44 が内部で `torch.compiler.is_compiling()` を呼ぶが、
+この関数は **torch 2.3 以降**で追加されたため 2.2.1 には存在しない。
+
+### 対処法
+
+```python
+if not hasattr(torch.compiler, "is_compiling"):
+    torch.compiler.is_compiling = lambda: False
+```
+
+---
+
+## エラー⑦ — `ExportedProgram` に `.meta` がない（2.2.1）
+
+### 発生箇所
+
+```python
+prepare_pt2e(exported_program, quantizer)
+```
+
+### エラー
+
+```
+AttributeError: 'ExportedProgram' object has no attribute 'meta'
+```
+
+### 原因
+
+torch 2.3 以降では `prepare_pt2e` が `ExportedProgram` を直接受け取れるが、
+2.2.1 では `GraphModule` を期待する。
+
+### 対処法
+
+```python
+gm = exported_program.module()   # GraphModule を取り出す
+prepare_pt2e(gm, quantizer)      # ✅
+```
+
+---
+
+## エラー⑧ — `prepared.eval()` が未サポート（2.2.1）
+
+### 発生箇所
+
+```python
+prepared.eval()
+```
+
+### エラー
+
+```
+NotImplementedError: Calling eval() is not supported yet.
+```
+
+### 原因
+
+`prepare_pt2e` が返す `GraphModule` は 2.2.1 時点で `eval()` 未対応。
+
+### 対処法
+
+`eval()` を呼ばずそのままキャリブレーションする。
+
+---
+
+## エラー⑨ — HistogramObserver が Long tensor で失敗（2.2.1）
+
+### 発生箇所
+
+キャリブレーション実行時。
+
+### エラー
+
+```
+RuntimeError: torch.histogram: input tensor and hist tensor should have
+the same dtype, but got input long int and hist float
+```
+
+### 原因
+
+`set_global(static config)` では activation observer が全ノードに挿入される。
+embedding への入力 (`input_ids`) など Long 型テンソルを持つノードにも挿入されてしまい、
+`HistogramObserver` が `histc` を Long tensor に対して呼び出す。
+
+2.2.1 では observer 挿入時の dtype フィルタが未実装のため発生する。
+
+### 対処法
+
+`is_dynamic=True` (Dynamic Quantization) を使う。
+weight のみ量子化し activation observer を挿入しないため回避できる。
+
+```python
+cfg = get_symmetric_quantization_config(is_dynamic=True)
+quantizer = XNNPACKQuantizer().set_global(cfg)
+```
+
+---
+
+## エラー⑩ — `torch.export.export` が `aten.linear` を分解する（2.2.1）
+
+### 発生箇所
+
+`torch.export.export` 後のグラフで `prepare_pt2e` を呼んでも observer が 0 になる。
+
+### 原因
+
+`torch.export.export` は `aten.linear.default` を `aten.addmm.default` に完全分解する。
+XNNPACKQuantizer の "linear" パターンマッチャーは `aten.linear.default` を探すため
+マッチしなくなり observer が挿入されない。
+
+### 対処法
+
+`torch._export.capture_pre_autograd_graph` を使う。
+これは `aten.linear.default` を保持したまま graph を capture する。
+
+```python
+from torch._export import capture_pre_autograd_graph
+gm = capture_pre_autograd_graph(model, example)
+# → aten.linear.default が保持される → XNNPACKQuantizer が正しく動作
+```
+
+> torch 2.3 以降では `torch.export.export` + decomposition table 指定が推奨になる。
+
+---
+
+## torch 2.2.1 で動作した最終構成
+
+```python
+import torch
+from transformers import AutoModelForCausalLM
+from torch._export import capture_pre_autograd_graph
+from torch.ao.quantization.quantize_pt2e import prepare_pt2e, convert_pt2e
+from torch.ao.quantization.quantizer.xnnpack_quantizer import (
+    XNNPACKQuantizer, get_symmetric_quantization_config,
+)
+
+# パッチ: torch.compiler.is_compiling が 2.2.1 に未実装
+if not hasattr(torch.compiler, "is_compiling"):
+    torch.compiler.is_compiling = lambda: False
+
+model = AutoModelForCausalLM.from_pretrained("Qwen/Qwen2.5-0.5B", torch_dtype=torch.float32)
+model.eval()
+
+class NoCacheWrapper(torch.nn.Module):
+    def __init__(self, m): super().__init__(); self.model = m
+    def forward(self, x): return self.model(x, use_cache=False).logits
+
+example = (torch.zeros(1, 16, dtype=torch.long),)
+gm = capture_pre_autograd_graph(NoCacheWrapper(model), example)  # linear 保持
+
+quantizer = XNNPACKQuantizer().set_global(
+    get_symmetric_quantization_config(is_dynamic=True)  # Long tensor 問題を回避
+)
+prepared = prepare_pt2e(gm, quantizer)   # observers: 2
+quantized = convert_pt2e(prepared)       # quantize/dequantize nodes: 4
+
+with torch.no_grad():
+    out = quantized(torch.zeros(1, 16, dtype=torch.long))
+# → Logits shape: torch.Size([1, 16, vocab_size])  ✅
+```
+
+---
+
+## バージョン別 API 対応まとめ
+
+| API | torch 2.2.1 | torch 2.11 |
+|-----|------------|-----------|
+| `torch.export.export` | ✅ | ✅ |
+| `capture_pre_autograd_graph` | ✅ (推奨) | △ (deprecated) |
+| `prepare_pt2e` / `convert_pt2e` | ✅ (`torch.ao`) | ❌ (torchao に移管) |
+| `XNNPACKQuantizer` | ✅ (`torch.ao`) | ❌ (torchao に移管) |
+| `torchao.quantize_()` | △ (別途インストール) | ✅ |
+| `torch.compiler.is_compiling` | ❌ (手動パッチ必要) | ✅ |
+| `prepared.eval()` | ❌ (未サポート) | ✅ |
+
+---
+
 ## 残課題
 
 - Qwen2.5-0.5B / 3B での実測（HuggingFace へのアクセスが必要）
 - INT8量子化後の PPL 変化を `eval_ppl/eval_ppl.py` と組み合わせて評価
-- `prepare_pt2e` / `convert_pt2e` の正式な torchao API が安定したら PT2E パイプラインに移行
+- Static Quantization の Long dtype 問題の根本解決（カスタム Quantizer で dtype フィルタ追加）
