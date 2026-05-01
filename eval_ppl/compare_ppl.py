@@ -9,12 +9,12 @@ Usage:
     python compare_ppl.py
 """
 
-import math
 import time
 from pathlib import Path
 
 import torch
-from transformers import AutoModelForCausalLM, AutoTokenizer, GPT2Tokenizer
+
+from ppl import compute_nll, token_perplexity, word_perplexity
 
 # ── Corpus (simulates WikiText test split) ────────────────────────────────────
 CORPUS = """
@@ -164,69 +164,24 @@ class LocalTokenizer:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Shared NLL computation (sliding window)
-# ─────────────────────────────────────────────────────────────────────────────
-
-def compute_nll_sequence(model, input_ids: torch.Tensor, max_length: int, stride: int):
-    """
-    Returns (total_nll, total_tokens, elapsed_sec).
-    stride = max_length  →  non-overlapping  (lm-eval default)
-    stride < max_length  →  overlapping      (more accurate)
-    """
-    seq_len = input_ids.size(1)
-    total_nll, total_tokens = 0.0, 0
-    prev_end = 0
-
-    t0 = time.perf_counter()
-    for begin in range(0, seq_len, stride):
-        end = min(begin + max_length, seq_len)
-        target_len = end - prev_end
-
-        window = input_ids[:, begin:end]
-        labels = window.clone()
-        labels[:, :-target_len] = -100  # mask context tokens
-
-        with torch.no_grad():
-            loss = model(window, labels=labels).loss  # mean NLL over unmasked tokens
-
-        total_nll += loss.item() * target_len
-        total_tokens += target_len
-        prev_end = end
-        if end == seq_len:
-            break
-
-    elapsed = time.perf_counter() - t0
-    return total_nll, total_tokens, elapsed
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Two evaluation methods
+# Two evaluation methods — both delegate to ppl.py
 # ─────────────────────────────────────────────────────────────────────────────
 
 def eval_custom(model, tokenizer, text: str, max_length: int):
-    """
-    (A) Custom eval_ppl.py style:
-        PPL = exp(total_NLL / total_tokens)   ← token perplexity
-        stride = max_length  (lm-eval default, non-overlapping)
-    """
+    """(A) token perplexity — denominator = tokens (our metric)"""
     input_ids = tokenizer(text).input_ids
-    nll, tokens, elapsed = compute_nll_sequence(model, input_ids, max_length, stride=max_length)
-    ppl = math.exp(nll / tokens)
-    return ppl, tokens, elapsed
+    t0 = time.perf_counter()
+    nll, tokens = compute_nll(model, input_ids, max_length, stride=max_length)
+    return token_perplexity(nll, tokens), tokens, time.perf_counter() - t0
 
 
 def eval_lmeval_style(model, tokenizer, text: str, max_length: int):
-    """
-    (B) lm-eval wikitext style:
-        word_perplexity = exp(total_NLL / total_words)   ← word perplexity
-        stride = max_length  (same non-overlapping window)
-        NLL computation is identical to (A); only the denominator differs.
-    """
+    """(B) word perplexity — denominator = words (lm-eval metric)"""
     input_ids = tokenizer(text).input_ids
-    nll, tokens, elapsed = compute_nll_sequence(model, input_ids, max_length, stride=max_length)
     words = tokenizer.count_words(text)
-    word_ppl = math.exp(nll / words)
-    return word_ppl, words, elapsed
+    t0 = time.perf_counter()
+    nll, _ = compute_nll(model, input_ids, max_length, stride=max_length)
+    return word_perplexity(nll, words), words, time.perf_counter() - t0
 
 
 # ─────────────────────────────────────────────────────────────────────────────
