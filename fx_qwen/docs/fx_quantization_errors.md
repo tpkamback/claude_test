@@ -34,7 +34,7 @@ ValueError: code: co_varnames is too small
 ### 原因
 
 `torch.fx.symbolic_trace` は内部でモデルの `forward()` 関数のバイトコードを書き換えてトレースする。
-transformers の CausalLM は `forward()` の引数が非常に多い（`input_ids`, `attention_mask`, `past_key_values`, `use_cache`, ... など20以上）ため、Python のコードオブジェクト内の `co_varnames` サイズ上限を超えてしまう。
+transformers の CausalLM は `forward()` の引数が非常に多い（`input_ids`, `attention_mask`, `past_key_values`, `use_cache`, ... など 20 以上）ため、Python のコードオブジェクト内の `co_varnames` サイズ上限を超えてしまう。
 
 ### 対処法
 
@@ -48,6 +48,81 @@ traced = torch.fx.symbolic_trace(model)
 # OK
 exported = torch.export.export(model, example_inputs)
 ```
+
+---
+
+## エラー① (補足) — `concrete_args` を使っても `symbolic_trace` は失敗する
+
+### 発生箇所
+
+```python
+# NoCacheWrapper で引数を input_ids だけに絞った上で concrete_args を渡しても失敗
+class NoCacheWrapper(torch.nn.Module):
+    def forward(self, input_ids):
+        return self.model(input_ids, use_cache=False).logits
+
+wrapped = NoCacheWrapper(model)
+example = torch.zeros(1, 16, dtype=torch.long)
+gm = torch.fx.symbolic_trace(wrapped, concrete_args={"input_ids": example})
+```
+
+### フルエラー
+
+```
+UserWarning: Was not able to add assertion to guarantee correct input input_ids
+    to specialized function. It is up to the user to make sure that your inputs
+    match the inputs you specialized the function with.
+
+torch.fx.proxy.TraceError: symbolically traced variables cannot be used as inputs
+    to control flow
+```
+
+エラー発生箇所（トレースバック末尾）:
+
+```
+File ".../transformers/masking_utils.py", line 874, in _preprocess_mask_arguments
+    if batch_size != position_ids.shape[0]:
+                     ^^^^^^^^^^^^^^^^^^^^^^^^^^^
+File ".../torch/fx/proxy.py", line 725, in __bool__
+    return self.tracer.to_bool(self)
+torch.fx.proxy.TraceError: symbolically traced variables cannot be used as inputs to control flow
+```
+
+### 原因
+
+`concrete_args` は `forward()` のシグネチャ引数（ここでは `input_ids`）だけを concrete 値として扱う。
+しかし `input_ids` からモデル内部で派生するテンソル（`position_ids`, `batch_size` など）は依然として **Symbolic Proxy** になる。
+
+transformers 5.x の `masking_utils.py` では `if batch_size != position_ids.shape[0]:` という比較が行われ、
+Proxy オブジェクトに対して `__bool__()` が呼ばれる → `TraceError`。
+
+`concrete_args` のキー名を変えても（`"input_ids"`, `{0: example}`, `{"self": ..., "input_ids": ...}` いずれも）結果は同じ。
+
+### なぜ `torch.export.export` は成功するか
+
+`torch.export` は dynamo（`torch.compile`）ベースのトレーサーで、制御フローをシンボリックに表現・処理できる。
+`symbolic_trace` のバイトコードパッチアプローチより遥かに robust。
+
+```python
+# symbolic_trace + concrete_args → 失敗（transformers 5.x + Qwen2）
+gm = torch.fx.symbolic_trace(wrapped, concrete_args={"input_ids": example})
+# TraceError: symbolically traced variables cannot be used as inputs to control flow
+
+# torch.export.export → 成功（torch 2.11, 210 nodes）
+exported = torch.export.export(wrapped, (torch.zeros(1, 16, dtype=torch.long),))
+# → 成功: 210 nodes, aten.linear.default を保持
+```
+
+### `torch.export.export` の出力詳細（torch 2.11、2層 toy Qwen2）
+
+| 項目 | 値 |
+|------|---|
+| 総ノード数 | 210 |
+| `call_function` ノード | 178 |
+| ユニーク op 数 | 33 |
+| 主要 op | `aten.linear.default` (15x), `aten.mul.Tensor` (20x), `aten.add.Tensor` (16x) |
+| `placeholder` ノード | 30（重みパラメータ + input_ids） |
+| `aten.linear.default` 保持 | ✅（quantizer パターンマッチングに有利） |
 
 ---
 
@@ -98,7 +173,7 @@ transformers 4.36 以降、CausalLM の `forward()` はデフォルトで KV キ
 
 ### 対処法
 
-`use_cache=False` を固定し、`logits` テンソルだけを返すラッパーモジュールを噛ませる。
+`use_cache=False` を固定し、`logits` テンソルだけを返すラッパーモジュールを噍ませる。
 
 ```python
 class NoCacheWrapper(torch.nn.Module):
@@ -290,7 +365,7 @@ torch 2.3 以降では `prepare_pt2e` が `ExportedProgram` を直接受け取�
 
 ```python
 gm = exported_program.module()   # GraphModule を取り出す
-prepare_pt2e(gm, quantizer)      # ✅
+gm = prepare_pt2e(gm, quantizer)      # ✅
 ```
 
 ---
@@ -420,7 +495,7 @@ with torch.no_grad():
 ## バージョン別 API 対応まとめ
 
 | API | torch 2.2.1 | torch 2.11 |
-|-----|------------|-----------|
+|-----|------------|----------|
 | `torch.export.export` | ✅ | ✅ |
 | `capture_pre_autograd_graph` | ✅ (推奨) | △ (deprecated) |
 | `prepare_pt2e` / `convert_pt2e` | ✅ (`torch.ao`) | ❌ (torchao に移管) |
@@ -521,7 +596,7 @@ act_obs = AffineQuantizedMinMaxObserver(
 
 ```
 insert_observers()    → LinearActivationWeightObservedTensor で Linear 層をラップ
-calibrate()           → 固定 seq_len でデータを流す（act_scale を収集）
+charm()           → 固定 seq_len でデータを流す（act_scale を収集）
 remove_observers()    → weight を float に戻す（observer tensor 除去）
 quantize_()           → Int8StaticActivationInt8WeightConfig(act_quant_scale=scale)
 inference             → logits shape [1, 16, 5000], 32.9ms ✅

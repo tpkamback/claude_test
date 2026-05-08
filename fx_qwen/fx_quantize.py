@@ -33,9 +33,9 @@ def parse_args():
     return parser.parse_args()
 
 
-# ─────────────────────────────────────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────────────────────────
 # Step 1: Load model
-# ─────────────────────────────────────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────────────────────────
 
 class NoCacheWrapper(torch.nn.Module):
     """
@@ -67,19 +67,27 @@ def load_model(model_id: str):
     return model, tokenizer
 
 
-# ─────────────────────────────────────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────────────────────────
 # Step 2: Export FX graph via torch.export
-# ─────────────────────────────────────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────────────────────────
 
 def export_model(model: torch.nn.Module, seq_len: int) -> torch.export.ExportedProgram:
     """
     Export the model to an FX graph using torch.export.export (PT2 / dynamo).
 
-    Why not torch.fx.symbolic_trace?
+    Why not torch.fx.symbolic_trace (even with concrete_args)?
         symbolic_trace uses Python bytecode patching and fails when the model's
         forward() has too many parameters:
             ValueError: code: co_varnames is too small
-        torch.export uses torch.compile / dynamo tracing, which is more robust.
+        Using NoCacheWrapper reduces forward() args to just input_ids, but
+        concrete_args={"input_ids": example} still fails in transformers 5.x:
+            TraceError: symbolically traced variables cannot be used as inputs to control flow
+        The root cause is that concrete_args only concretizes the named argument
+        itself; tensors derived inside the model (position_ids, batch_size, etc.)
+        remain Symbolic Proxies. transformers 5.x masking_utils.py calls
+        `if batch_size != position_ids.shape[0]:`, triggering Proxy.__bool__().
+        torch.export uses torch.compile / dynamo tracing, which handles control
+        flow symbolically and is robust to this pattern.
 
     Why not torch.ao.quantization.quantize_fx.prepare_fx?
         torch.ao.quantization is deprecated in PyTorch >= 2.10:
@@ -95,9 +103,9 @@ def export_model(model: torch.nn.Module, seq_len: int) -> torch.export.ExportedP
     return exported
 
 
-# ─────────────────────────────────────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────────────────────────
 # Step 3: Quantize with torchao
-# ─────────────────────────────────────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────────────────────────
 
 def quantize_model(model: torch.nn.Module, quant_type: str) -> torch.nn.Module:
     """
@@ -125,9 +133,9 @@ def quantize_model(model: torch.nn.Module, quant_type: str) -> torch.nn.Module:
     return model
 
 
-# ─────────────────────────────────────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────────────────────────
 # Step 4: Verify inference
-# ─────────────────────────────────────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────────────────────────
 
 def verify_inference(model: torch.nn.Module, seq_len: int):
     print("[4/4] Running inference on quantized model ...")
@@ -140,9 +148,9 @@ def verify_inference(model: torch.nn.Module, seq_len: int):
     print(f"      Inference time: {elapsed*1000:.1f} ms")
 
 
-# ─────────────────────────────────────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────────────────────────
 # Main
-# ─────────────────────────────────────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────────────────────────
 
 def main():
     args = parse_args()

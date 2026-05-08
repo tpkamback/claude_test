@@ -55,6 +55,7 @@ CausalLM
 | エラー | 原因 | 対処 |
 |--------|------|------|
 | `co_varnames is too small` | `torch.fx.symbolic_trace` が複雑な forward を処理できない | `torch.export.export` に切り替え |
+| `symbolic_trace + concrete_args` でも TraceError | concrete_args はシグネチャ引数のみ concrete 化。派生テンソル (position_ids 等) が Proxy になり transformers 5.x の masking_utils 内の if 文で Proxy.__bool__() が呼ばれる | `torch.export.export` を使う（dynamo ベースで制御フロー対応） |
 | `No module named transformers.utils.fx` | transformers 5.x で削除済み | `torch.export.export` を直接使用 |
 | `DynamicCache` not a known type | KV キャッシュが pytree 未登録 | `NoCacheWrapper` で `use_cache=False` に固定 |
 | `torch.ao.quantization` deprecated | PyTorch 2.10 以降廃止 | `torchao.quantize_()` に移行 |
