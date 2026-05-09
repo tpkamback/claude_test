@@ -44,10 +44,8 @@ pt2e_quantize_280.py — PT2E QDQ 量子化の最小実装 (torch 2.8)
 === 実行方法 ===
   python pt2e_quantize_280.py
   python pt2e_quantize_280.py --model ../eval_ppl/models/qwen-tiny
-  python pt2e_quantize_280.py --model ../eval_ppl/models/Qwen2.5-0.5B-random --quantizer all
+  python pt2e_quantize_280.py --model ../eval_ppl/models/Qwen2.5-0.5B-random
   python pt2e_quantize_280.py --seq_len 32
-  python pt2e_quantize_280.py --quantizer all
-  python pt2e_quantize_280.py --quantizer linear
 
 === AllOpsQuantizer — 対象 op と調査結果 ===
 
@@ -89,7 +87,7 @@ import time
 import torch
 from transformers import AutoModelForCausalLM
 
-# ── PT2E API (torch 2.8) ───────────────────────────────────────────────────────────────────
+# ── PT2E API (torch 2.8) ─────────────────────────────────────────────────────────────────────────────────────────
 # torch 2.8 での capture: export_for_training を使う
 # torch._export.capture_pre_autograd_graph は 2.8 で削除されている
 from torch.export import export_for_training
@@ -97,64 +95,15 @@ from torch.ao.quantization.quantize_pt2e import prepare_pt2e, convert_pt2e
 from torch.ao.quantization.quantizer import Quantizer
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Quantizer 定義: aten.linear.default に per-tensor symmetric int8 を適用
-# ─────────────────────────────────────────────────────────────────────────────
-
-class LinearInt8Quantizer(Quantizer):
-    """
-    aten.linear.default ノードに対して per-tensor symmetric int8 の
-    QDQ (Quantize-Dequantize) アノテーションを付与する最小 Quantizer。
-
-    XNNPACKQuantizer のような完全実装と異なり、aten.linear のみを対象とする。
-    カスタム Quantizer の実装パターンの参考として使用できる。
-    """
-
-    def annotate(self, model: torch.fx.GraphModule) -> torch.fx.GraphModule:
-        from torch.ao.quantization.quantizer import QuantizationAnnotation, QuantizationSpec
-        from torch.ao.quantization.observer import MinMaxObserver
-
-        act_spec = QuantizationSpec(
-            dtype=torch.int8,
-            quant_min=-128,
-            quant_max=127,
-            qscheme=torch.per_tensor_symmetric,
-            observer_or_fake_quant_ctr=MinMaxObserver,
-        )
-
-        annotated = 0
-        for node in model.graph.nodes:
-            if (
-                node.op == "call_function"
-                and node.target == torch.ops.aten.linear.default
-            ):
-                node.meta["quantization_annotation"] = QuantizationAnnotation(
-                    input_qspec_map={
-                        node.args[0]: act_spec,  # activation
-                        node.args[1]: act_spec,  # weight
-                    },
-                    output_qspec=act_spec,
-                )
-                annotated += 1
-
-        print(f"      annotated {annotated} aten.linear node(s)")
-        return model
-
-    def validate(self, model: torch.fx.GraphModule) -> None:
-        pass
-
-
-# ─────────────────────────────────────────────────────────────────────────────
+# ───────────────────────────────────────────────────────────────────────────────
 # Quantizer 定義: 全演算ノード (float出力) に per-tensor symmetric int8 を適用
-# ─────────────────────────────────────────────────────────────────────────────
+# ───────────────────────────────────────────────────────────────────────────────
 
 class AllOpsQuantizer(Quantizer):
     """
     グラフ中の全演算ノードに per-tensor symmetric int8 の QDQ アノテーションを付与する。
 
-    LinearInt8Quantizer が aten.linear のみを対象とするのに対し、
-    AllOpsQuantizer は出力 dtype が float (float32/float16/bfloat16) である
-    全 call_function ノードを対象とする。
+    出力 dtype が float (float32/float16/bfloat16) である全 call_function ノードを対象とする。
 
     対象 op (Qwen 系モデルでの主要演算):
       - aten.linear.default          (Linear 全層)
@@ -257,9 +206,9 @@ class AllOpsQuantizer(Quantizer):
         pass
 
 
-# ─────────────────────────────────────────────────────────────────────────────
+# ───────────────────────────────────────────────────────────────────────────────
 # ラッパーモジュール
-# ─────────────────────────────────────────────────────────────────────────────
+# ───────────────────────────────────────────────────────────────────────────────
 
 class NoCacheWrapper(torch.nn.Module):
     """
@@ -275,9 +224,9 @@ class NoCacheWrapper(torch.nn.Module):
         return self.model(input_ids, use_cache=False).logits
 
 
-# ─────────────────────────────────────────────────────────────────────────────
+# ───────────────────────────────────────────────────────────────────────────────
 # Step 1: ロード
-# ─────────────────────────────────────────────────────────────────────────────
+# ───────────────────────────────────────────────────────────────────────────────
 
 def load(model_id: str, seq_len: int):
     print(f"[1/5] Loading: {model_id}")
@@ -292,9 +241,9 @@ def load(model_id: str, seq_len: int):
     return wrapped, example
 
 
-# ─────────────────────────────────────────────────────────────────────────────
+# ───────────────────────────────────────────────────────────────────────────────
 # Step 2: エクスポート (export_for_training)
-# ─────────────────────────────────────────────────────────────────────────────
+# ───────────────────────────────────────────────────────────────────────────────
 
 def export(model: torch.nn.Module, example: tuple) -> torch.fx.GraphModule:
     """
@@ -317,36 +266,28 @@ def export(model: torch.nn.Module, example: tuple) -> torch.fx.GraphModule:
     return gm
 
 
-# ─────────────────────────────────────────────────────────────────────────────
+# ───────────────────────────────────────────────────────────────────────────────
 # Step 3: prepare_pt2e
-# ─────────────────────────────────────────────────────────────────────────────
+# ───────────────────────────────────────────────────────────────────────────────
 
-def prepare(gm: torch.fx.GraphModule, quantizer_name: str = "all") -> torch.fx.GraphModule:
+def prepare(gm: torch.fx.GraphModule) -> torch.fx.GraphModule:
     """
     prepare_pt2e で observer (fake quantize) を挿入する。
 
-    quantizer_name:
-      "linear" — LinearInt8Quantizer: aten.linear のみ対象
-      "all"    — AllOpsQuantizer: 全演算ノード (float出力) を対象
+    AllOpsQuantizer を使用して全演算ノード (float出力) を対象とする。
     """
-    print(f"[3/5] prepare_pt2e (quantizer={quantizer_name}) ...")
+    print("[3/5] prepare_pt2e (quantizer=AllOpsQuantizer) ...")
 
-    if quantizer_name == "linear":
-        quantizer = LinearInt8Quantizer()
-    elif quantizer_name == "all":
-        quantizer = AllOpsQuantizer()
-    else:
-        raise ValueError(f"Unknown quantizer: {quantizer_name!r}. Choose 'linear' or 'all'.")
-
+    quantizer = AllOpsQuantizer()
     prepared = prepare_pt2e(gm, quantizer)
     obs = sum(1 for n in prepared.graph.nodes if "activation_post_process" in n.name)
     print(f"      observer nodes inserted: {obs}")
     return prepared
 
 
-# ─────────────────────────────────────────────────────────────────────────────
+# ───────────────────────────────────────────────────────────────────────────────
 # Step 4: キャリブレーション
-# ─────────────────────────────────────────────────────────────────────────────
+# ───────────────────────────────────────────────────────────────────────────────
 
 def calibrate(prepared: torch.fx.GraphModule, seq_len: int) -> None:
     """
@@ -360,9 +301,9 @@ def calibrate(prepared: torch.fx.GraphModule, seq_len: int) -> None:
     print("      calibration done (1 sample)")
 
 
-# ─────────────────────────────────────────────────────────────────────────────
+# ───────────────────────────────────────────────────────────────────────────────
 # Step 5: convert_pt2e + 推論確認
-# ─────────────────────────────────────────────────────────────────────────────
+# ───────────────────────────────────────────────────────────────────────────────
 
 def convert_and_verify(prepared: torch.fx.GraphModule, seq_len: int) -> torch.fx.GraphModule:
     """
@@ -387,9 +328,9 @@ def convert_and_verify(prepared: torch.fx.GraphModule, seq_len: int) -> torch.fx
     return quantized
 
 
-# ─────────────────────────────────────────────────────────────────────────────
+# ───────────────────────────────────────────────────────────────────────────────
 # CLI
-# ─────────────────────────────────────────────────────────────────────────────
+# ───────────────────────────────────────────────────────────────────────────────
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
@@ -397,12 +338,6 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--model", default="../eval_ppl/models/qwen-tiny")
     parser.add_argument("--seq_len", type=int, default=16)
-    parser.add_argument(
-        "--quantizer",
-        choices=["linear", "all"],
-        default="all",
-        help="Quantizer to use: 'linear' (aten.linear only) or 'all' (all float ops)",
-    )
     return parser.parse_args()
 
 
@@ -419,7 +354,7 @@ def main() -> None:
         return
 
     try:
-        prepared = prepare(gm, args.quantizer)
+        prepared = prepare(gm)
     except Exception as e:
         print(f"[ERROR] prepare_pt2e: {type(e).__name__}: {e}")
         return
