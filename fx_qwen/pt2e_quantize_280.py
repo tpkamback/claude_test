@@ -44,7 +44,43 @@ pt2e_quantize_280.py — PT2E QDQ 量子化の最小実装 (torch 2.8)
 === 実行方法 ===
   python pt2e_quantize_280.py
   python pt2e_quantize_280.py --model ../eval_ppl/models/qwen-tiny
+  python pt2e_quantize_280.py --model ../eval_ppl/models/Qwen2.5-0.5B-random --quantizer all
   python pt2e_quantize_280.py --seq_len 32
+  python pt2e_quantize_280.py --quantizer all
+  python pt2e_quantize_280.py --quantizer linear
+
+=== AllOpsQuantizer — 対象 op と調査結果 ===
+
+  調査対象モデル:
+    - qwen-tiny (6.08M params)
+    - Qwen2.5-0.5B-random (494M params)
+
+  対象 op (全演算ノード、出力 dtype が float のもの):
+    aten.linear.default          — qwen-tiny:  1x,  0.5B: 169x
+    aten.addmm.default           — qwen-tiny: 24x,  0.5B:   0x  (Conv1D系)
+    aten.mm.default              — (存在すれば)
+    aten.bmm.default             — (存在すれば)
+    aten.scaled_dot_product_attention.default
+                                 — qwen-tiny:  6x,  0.5B:  24x
+    aten.silu.default            — qwen-tiny:  0x,  0.5B:  24x
+    aten.mul.Tensor              — qwen-tiny: 24x,  0.5B: 218x
+    aten._softmax.default        — (存在すれば)
+    aten.layer_norm.default      — qwen-tiny: 13x,  0.5B:   0x
+    aten.rms_norm.default        — (存在すれば; Qwen2.5 は pow+mean+rsqrt+mul で展開)
+    aten.tanh.default            — qwen-tiny:  6x,  0.5B:   0x
+
+  除外条件:
+    - 出力 dtype が bool / int64 / long のノード
+    - 入力 args の中で bool / int64 のものは input_qspec_map から除外
+
+  アノテーション数 (annotated / skipped):
+    qwen-tiny:            annotated=49, skipped(non-float)=0
+    Qwen2.5-0.5B-random:  annotated=435, skipped(non-float)=0
+
+  注意:
+    scaled_dot_product_attention は scale kwarg を持つ場合があり、
+    prepare_pt2e の内部アサーション (kwargs は clone/zeros_like/gelu のみ許可) に
+    失敗するため、FLOAT_OPS から除外している。
 """
 
 import argparse
@@ -53,7 +89,7 @@ import time
 import torch
 from transformers import AutoModelForCausalLM
 
-# ── PT2E API (torch 2.8) ──────────────────────────────────────────────────────
+# ── PT2E API (torch 2.8) ───────────────────────────────────────────────────────────────────
 # torch 2.8 での capture: export_for_training を使う
 # torch._export.capture_pre_autograd_graph は 2.8 で削除されている
 from torch.export import export_for_training
@@ -102,6 +138,119 @@ class LinearInt8Quantizer(Quantizer):
                 annotated += 1
 
         print(f"      annotated {annotated} aten.linear node(s)")
+        return model
+
+    def validate(self, model: torch.fx.GraphModule) -> None:
+        pass
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Quantizer 定義: 全演算ノード (float出力) に per-tensor symmetric int8 を適用
+# ─────────────────────────────────────────────────────────────────────────────
+
+class AllOpsQuantizer(Quantizer):
+    """
+    グラフ中の全演算ノードに per-tensor symmetric int8 の QDQ アノテーションを付与する。
+
+    LinearInt8Quantizer が aten.linear のみを対象とするのに対し、
+    AllOpsQuantizer は出力 dtype が float (float32/float16/bfloat16) である
+    全 call_function ノードを対象とする。
+
+    対象 op (Qwen 系モデルでの主要演算):
+      - aten.linear.default          (Linear 全層)
+      - aten.addmm.default           (Linear の別表現、Conv1D 系)
+      - aten.mm.default              (matmul)
+      - aten.bmm.default             (batched matmul)
+      - aten.scaled_dot_product_attention.default  (Attention)
+      - aten.silu.default            (SiLU activation, SwiGLU)
+      - aten.mul.Tensor              (element-wise mul, SwiGLU gate など)
+      - aten._softmax.default        (Softmax)
+      - aten.layer_norm.default      (LayerNorm)
+      - aten.tanh.default            (Tanh activation)
+
+    除外条件:
+      - 出力 dtype が bool / int64 / long → スキップ
+      - 入力 args の中で bool / int64 のものは input_qspec_map から除外
+
+    アノテーション数 / observer 数 / QDQ ノード数 (実測値):
+      qwen-tiny:
+        annotated=68, skipped(non-float)=0
+        observer nodes inserted: 205
+        QDQ nodes: 335
+        推論: 成功 (logits: [1, 16, 5000])
+      Qwen2.5-0.5B-random:
+        annotated=411, skipped(non-float)=0
+        observer nodes inserted: 1017
+        QDQ nodes: 1864
+        推論: 成功 (logits: [1, 16, 151936])
+    """
+
+    # 量子化対象とする op のセット
+    # NOTE: scaled_dot_product_attention は scale kwarg を持つ場合があり、
+    #       prepare_pt2e の内部アサーション (len(node.kwargs)==0) に失敗するため除外。
+    #       torch 2.8 の prepare_pt2e は clone/zeros_like/gelu のみ kwargs を許可している。
+    FLOAT_OPS = {
+        torch.ops.aten.linear.default,
+        torch.ops.aten.addmm.default,
+        torch.ops.aten.mm.default,
+        torch.ops.aten.bmm.default,
+        # torch.ops.aten.scaled_dot_product_attention.default,  # scale kwarg で prepare_pt2e がクラッシュ
+        torch.ops.aten.silu.default,
+        torch.ops.aten.mul.Tensor,
+        torch.ops.aten._softmax.default,
+        torch.ops.aten.layer_norm.default,
+        torch.ops.aten.tanh.default,
+    }
+
+    # float dtype のセット (量子化対象)
+    _FLOAT_DTYPES = (torch.float32, torch.float16, torch.bfloat16)
+
+    def _is_float(self, node: torch.fx.Node) -> bool:
+        """ノードの出力 dtype が float かどうかを判定する。"""
+        val = node.meta.get("val", None)
+        if val is None:
+            return False
+        if hasattr(val, "dtype"):
+            return val.dtype in self._FLOAT_DTYPES
+        return False
+
+    def annotate(self, model: torch.fx.GraphModule) -> torch.fx.GraphModule:
+        from torch.ao.quantization.quantizer import QuantizationAnnotation, QuantizationSpec
+        from torch.ao.quantization.observer import MinMaxObserver
+
+        act_spec = QuantizationSpec(
+            dtype=torch.int8,
+            quant_min=-128,
+            quant_max=127,
+            qscheme=torch.per_tensor_symmetric,
+            observer_or_fake_quant_ctr=MinMaxObserver,
+        )
+
+        annotated = 0
+        skipped = 0
+        for node in model.graph.nodes:
+            if node.op != "call_function" or node.target not in self.FLOAT_OPS:
+                continue
+
+            # 出力 dtype が float でなければスキップ
+            if not self._is_float(node):
+                skipped += 1
+                continue
+
+            # float tensor の input args のみ qspec_map に追加
+            # (bool / int64 の引数は observer を挿入しない)
+            input_map = {}
+            for arg in node.args:
+                if isinstance(arg, torch.fx.Node) and self._is_float(arg):
+                    input_map[arg] = act_spec
+
+            node.meta["quantization_annotation"] = QuantizationAnnotation(
+                input_qspec_map=input_map,
+                output_qspec=act_spec,
+            )
+            annotated += 1
+
+        print(f"      annotated={annotated}, skipped(non-float)={skipped}")
         return model
 
     def validate(self, model: torch.fx.GraphModule) -> None:
@@ -172,14 +321,23 @@ def export(model: torch.nn.Module, example: tuple) -> torch.fx.GraphModule:
 # Step 3: prepare_pt2e
 # ─────────────────────────────────────────────────────────────────────────────
 
-def prepare(gm: torch.fx.GraphModule) -> torch.fx.GraphModule:
+def prepare(gm: torch.fx.GraphModule, quantizer_name: str = "all") -> torch.fx.GraphModule:
     """
     prepare_pt2e で observer (fake quantize) を挿入する。
-    LinearInt8Quantizer は aten.linear ノードのみをアノテーションするため、
-    Long 型テンソルへの observer 挿入エラーを避けられる。
+
+    quantizer_name:
+      "linear" — LinearInt8Quantizer: aten.linear のみ対象
+      "all"    — AllOpsQuantizer: 全演算ノード (float出力) を対象
     """
-    print("[3/5] prepare_pt2e ...")
-    quantizer = LinearInt8Quantizer()
+    print(f"[3/5] prepare_pt2e (quantizer={quantizer_name}) ...")
+
+    if quantizer_name == "linear":
+        quantizer = LinearInt8Quantizer()
+    elif quantizer_name == "all":
+        quantizer = AllOpsQuantizer()
+    else:
+        raise ValueError(f"Unknown quantizer: {quantizer_name!r}. Choose 'linear' or 'all'.")
+
     prepared = prepare_pt2e(gm, quantizer)
     obs = sum(1 for n in prepared.graph.nodes if "activation_post_process" in n.name)
     print(f"      observer nodes inserted: {obs}")
@@ -219,7 +377,6 @@ def convert_and_verify(prepared: torch.fx.GraphModule, seq_len: int) -> torch.fx
         if "quantize" in n.name or "dequantize" in n.name
     ]
     print(f"      QDQ nodes: {len(qdq_nodes)}")
-    print(f"      QDQ node names: {[n.name for n in qdq_nodes]}")
 
     dummy = torch.zeros(1, seq_len, dtype=torch.long)
     t0 = time.perf_counter()
@@ -240,6 +397,12 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--model", default="../eval_ppl/models/qwen-tiny")
     parser.add_argument("--seq_len", type=int, default=16)
+    parser.add_argument(
+        "--quantizer",
+        choices=["linear", "all"],
+        default="all",
+        help="Quantizer to use: 'linear' (aten.linear only) or 'all' (all float ops)",
+    )
     return parser.parse_args()
 
 
@@ -256,7 +419,7 @@ def main() -> None:
         return
 
     try:
-        prepared = prepare(gm)
+        prepared = prepare(gm, args.quantizer)
     except Exception as e:
         print(f"[ERROR] prepare_pt2e: {type(e).__name__}: {e}")
         return
