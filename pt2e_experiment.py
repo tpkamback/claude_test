@@ -397,6 +397,170 @@ def test_gemma_tiny():
     return run_pt2e("Gemma-tiny (2L)", model, (ids,), quantizer=AllOpsQuantizer())
 
 
+# ── VLM ───────────────────────────────────────────────────────────────────────
+
+def test_clip_tiny():
+    from transformers import CLIPModel, CLIPConfig
+    from transformers import CLIPTextConfig, CLIPVisionConfig
+    vision_cfg = CLIPVisionConfig(
+        hidden_size=256, num_hidden_layers=2, num_attention_heads=4,
+        intermediate_size=512, image_size=224, patch_size=32,
+    )
+    text_cfg = CLIPTextConfig(
+        hidden_size=256, num_hidden_layers=2, num_attention_heads=4,
+        intermediate_size=512, max_position_embeddings=32,
+    )
+    config = CLIPConfig(text_config=text_cfg, vision_config=vision_cfg)
+    model = CLIPModel(config).eval()
+
+    class CLIPWrapper(torch.nn.Module):
+        def __init__(self, m): super().__init__(); self.m = m
+        def forward(self, pixel_values, input_ids, attention_mask):
+            out = self.m(pixel_values=pixel_values, input_ids=input_ids,
+                         attention_mask=attention_mask)
+            return out.logits_per_image
+
+    wrapped = CLIPWrapper(model)
+    pixel = torch.randn(1, 3, 224, 224)
+    ids = torch.ones(1, 16, dtype=torch.long)
+    mask = torch.ones(1, 16, dtype=torch.long)
+    return run_pt2e("CLIP-tiny", wrapped, (pixel, ids, mask),
+                    quantizer=AllOpsQuantizer())
+
+
+def test_llava_tiny():
+    from transformers import LlavaForConditionalGeneration, LlavaConfig
+    from transformers import CLIPVisionConfig, LlamaConfig
+    vision_cfg = CLIPVisionConfig(
+        hidden_size=256, num_hidden_layers=2, num_attention_heads=4,
+        intermediate_size=512, image_size=224, patch_size=32,
+    )
+    text_cfg = LlamaConfig(
+        hidden_size=256, num_hidden_layers=2, num_attention_heads=4,
+        intermediate_size=512, num_key_value_heads=4,
+    )
+    config = LlavaConfig(vision_config=vision_cfg, text_config=text_cfg)
+    model = LlavaForConditionalGeneration(config).eval()
+
+    class LlavaWrapper(torch.nn.Module):
+        def __init__(self, m): super().__init__(); self.m = m
+        def forward(self, input_ids, pixel_values):
+            return self.m(input_ids=input_ids, pixel_values=pixel_values,
+                          use_cache=False).logits
+
+    wrapped = LlavaWrapper(model)
+    # LLaVA expects image tokens embedded in input_ids (use dummy ids)
+    ids = torch.ones(1, 20, dtype=torch.long)
+    pixel = torch.randn(1, 3, 224, 224)
+    return run_pt2e("LLaVA-tiny", wrapped, (ids, pixel),
+                    quantizer=AllOpsQuantizer())
+
+
+def test_paligemma_tiny():
+    from transformers import PaliGemmaForConditionalGeneration, PaliGemmaConfig
+    from transformers import SiglipVisionConfig, GemmaConfig
+    vision_cfg = SiglipVisionConfig(
+        hidden_size=256, num_hidden_layers=2, num_attention_heads=4,
+        intermediate_size=512, image_size=224, patch_size=32,
+    )
+    text_cfg = GemmaConfig(
+        hidden_size=256, num_hidden_layers=2, num_attention_heads=4,
+        intermediate_size=512, num_key_value_heads=4, head_dim=64,
+    )
+    config = PaliGemmaConfig(vision_config=vision_cfg, text_config=text_cfg)
+    model = PaliGemmaForConditionalGeneration(config).eval()
+
+    class PGWrapper(torch.nn.Module):
+        def __init__(self, m): super().__init__(); self.m = m
+        def forward(self, input_ids, pixel_values):
+            return self.m(input_ids=input_ids, pixel_values=pixel_values,
+                          use_cache=False).logits
+
+    wrapped = PGWrapper(model)
+    ids = torch.ones(1, 20, dtype=torch.long)
+    pixel = torch.randn(1, 3, 224, 224)
+    return run_pt2e("PaliGemma-tiny", wrapped, (ids, pixel),
+                    quantizer=AllOpsQuantizer())
+
+
+def test_qwen2vl_tiny():
+    from transformers import Qwen2VLForConditionalGeneration, Qwen2VLConfig
+    config = Qwen2VLConfig(
+        hidden_size=256, num_hidden_layers=2, num_attention_heads=4,
+        intermediate_size=512, num_key_value_heads=4,
+    )
+    model = Qwen2VLForConditionalGeneration(config).eval()
+
+    class Qwen2VLWrapper(torch.nn.Module):
+        def __init__(self, m): super().__init__(); self.m = m
+        def forward(self, input_ids, attention_mask):
+            return self.m(input_ids=input_ids, attention_mask=attention_mask,
+                          use_cache=False).logits
+
+    wrapped = Qwen2VLWrapper(model)
+    ids = torch.ones(1, 16, dtype=torch.long)
+    mask = torch.ones(1, 16, dtype=torch.long)
+    return run_pt2e("Qwen2-VL-tiny", wrapped, (ids, mask),
+                    quantizer=AllOpsQuantizer())
+
+
+def test_blip2_tiny():
+    from transformers import Blip2ForConditionalGeneration, Blip2Config
+    from transformers import Blip2VisionConfig, Blip2QFormerConfig, OPTConfig
+    vision_cfg = Blip2VisionConfig(
+        hidden_size=256, num_hidden_layers=2, num_attention_heads=4,
+        intermediate_size=512, image_size=224, patch_size=32,
+    )
+    qformer_cfg = Blip2QFormerConfig(
+        hidden_size=256, num_hidden_layers=2, num_attention_heads=4,
+        intermediate_size=512,
+    )
+    text_cfg = OPTConfig(
+        hidden_size=256, num_hidden_layers=2, num_attention_heads=4,
+        ffn_dim=512, word_embed_proj_dim=256,
+    )
+    config = Blip2Config(vision_config=vision_cfg, qformer_config=qformer_cfg,
+                         text_config=text_cfg)
+    model = Blip2ForConditionalGeneration(config).eval()
+
+    class Blip2Wrapper(torch.nn.Module):
+        def __init__(self, m): super().__init__(); self.m = m
+        def forward(self, pixel_values, input_ids):
+            return self.m(pixel_values=pixel_values, input_ids=input_ids,
+                          use_cache=False).logits
+
+    wrapped = Blip2Wrapper(model)
+    pixel = torch.randn(1, 3, 224, 224)
+    ids = torch.ones(1, 16, dtype=torch.long)
+    return run_pt2e("BLIP-2-tiny", wrapped, (pixel, ids),
+                    quantizer=AllOpsQuantizer())
+
+
+def test_qwen2vl_local():
+    import os
+    path = "/home/user/claude_test/vlm_eval/models/qwen/Qwen2___5-VL-2B-Instruct"
+    if not os.path.exists(path) or not any(
+        f.endswith((".bin", ".safetensors")) for f in os.listdir(path)
+    ):
+        r = Result("Qwen2.5-VL-2B (local)")
+        r.note = "model weights not found"
+        return r
+    from transformers import Qwen2VLForConditionalGeneration
+    model = Qwen2VLForConditionalGeneration.from_pretrained(path).eval()
+
+    class Qwen2VLWrapper(torch.nn.Module):
+        def __init__(self, m): super().__init__(); self.m = m
+        def forward(self, input_ids, attention_mask):
+            return self.m(input_ids=input_ids, attention_mask=attention_mask,
+                          use_cache=False).logits
+
+    wrapped = Qwen2VLWrapper(model)
+    ids = torch.ones(1, 16, dtype=torch.long)
+    mask = torch.ones(1, 16, dtype=torch.long)
+    return run_pt2e("Qwen2.5-VL-2B (local)", wrapped, (ids, mask),
+                    quantizer=AllOpsQuantizer())
+
+
 # ── Runner ────────────────────────────────────────────────────────────────────
 
 TESTS = [
@@ -422,10 +586,17 @@ TESTS = [
     test_falcon_tiny,
     test_phi2_tiny,
     test_gemma_tiny,
-    # Local weights
+    # Local LLM weights
     test_qwen2_local,
     test_qwen1_local,
     test_gpt2_local,
+    # VLM
+    test_clip_tiny,
+    test_llava_tiny,
+    test_paligemma_tiny,
+    test_qwen2vl_tiny,
+    test_blip2_tiny,
+    test_qwen2vl_local,
 ]
 
 
