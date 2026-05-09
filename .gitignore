@@ -1,0 +1,8 @@
+__pycache__/
+*.pyc
+*.pyo
+.venv*/
+.DS_Store
+*.html
+vlm_eval/models/
+eval_ppl/models/
