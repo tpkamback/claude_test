@@ -354,7 +354,9 @@ def test_unet_seg():
 def test_deeplab_v3():
     from torchvision.models.segmentation import deeplabv3_resnet50
     class W(torch.nn.Module):
-        def __init__(self): super().__init__(); self.m = deeplabv3_resnet50(weights=None, num_classes=21)
+        def __init__(self):
+            super().__init__()
+            self.m = deeplabv3_resnet50(weights=None, weights_backbone=None, num_classes=21)
         def forward(self, x): return self.m(x)["out"]
     return trace("DeepLabV3-R50", W(), (torch.randn(1, 3, 224, 224),))
 
@@ -362,7 +364,9 @@ def test_deeplab_v3():
 def test_fcn_r50():
     from torchvision.models.segmentation import fcn_resnet50
     class W(torch.nn.Module):
-        def __init__(self): super().__init__(); self.m = fcn_resnet50(weights=None, num_classes=21)
+        def __init__(self):
+            super().__init__()
+            self.m = fcn_resnet50(weights=None, weights_backbone=None, num_classes=21)
         def forward(self, x): return self.m(x)["out"]
     return trace("FCN-R50", W(), (torch.randn(1, 3, 224, 224),))
 
@@ -415,7 +419,7 @@ def test_yolov3():
 def test_yolov5():
     try:
         import torch.hub
-        m = torch.hub.load("ultralytics/yolov5", "yolov5s", pretrained=False, verbose=False)
+        m = torch.hub.load("ultralytics/yolov5", "yolov5s", pretrained=False, verbose=False, trust_repo=True)
         class W(torch.nn.Module):
             def __init__(self, inner): super().__init__(); self.m = inner
             def forward(self, x): return self.m(x)
