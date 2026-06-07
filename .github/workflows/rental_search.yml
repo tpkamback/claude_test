@@ -1,0 +1,42 @@
+name: 賃貸物件検索（松戸周辺）
+
+on:
+  schedule:
+    - cron: '0 0 * * 1'   # 毎週月曜 09:00 JST (= UTC 00:00)
+  workflow_dispatch:        # GitHub UI から手動実行も可
+
+jobs:
+  search:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write       # seen_properties.json をコミットするため
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: 依存パッケージをインストール
+        run: pip install -r rental_search/requirements.txt
+
+      - name: 物件検索・メール通知
+        env:
+          GMAIL_USER: ${{ secrets.GMAIL_USER }}
+          GMAIL_APP_PASSWORD: ${{ secrets.GMAIL_APP_PASSWORD }}
+          NOTIFY_EMAIL: ${{ secrets.NOTIFY_EMAIL }}
+          SCRAPERAPI_KEY: ${{ secrets.SCRAPERAPI_KEY }}
+        run: python rental_search/main.py
+
+      - name: 既知物件リストをコミット
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add -f rental_search/seen_properties.json 2>/dev/null || true
+          if git diff --staged --quiet; then
+            echo "seen_properties.json に変更なし"
+          else
+            git commit -m "chore: update seen_properties [skip ci]"
+            git push
+          fi

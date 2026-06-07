@@ -26,6 +26,9 @@ MIN_AREA  = 70.0      # 最小専有面積（m²）
 SCRIPT_DIR = Path(__file__).parent
 STATE_FILE = SCRIPT_DIR / "seen_properties.json"
 
+# ScraperAPI キー（環境変数 SCRAPERAPI_KEY で設定）
+SCRAPERAPI_KEY = os.environ.get("SCRAPERAPI_KEY", "")
+
 HEADERS = {
     "User-Agent": (
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
@@ -87,6 +90,19 @@ def has_parking(text: str) -> bool:
     return bool(re.search(r"駐車[場位]|パーキング|ガレージ|車庫", text))
 
 
+def scraper_get(session: requests.Session, url: str, **kwargs) -> requests.Response:
+    """ScraperAPI 経由でリクエスト。キー未設定なら直接アクセス。"""
+    if SCRAPERAPI_KEY:
+        api_url = (
+            f"http://api.scraperapi.com"
+            f"?api_key={SCRAPERAPI_KEY}"
+            f"&url={requests.utils.quote(url, safe='')}"
+            f"&country_code=jp"
+        )
+        return session.get(api_url, **kwargs)
+    return session.get(url, **kwargs)
+
+
 # ── SUUMO ─────────────────────────────────────────────────────────────────────
 
 SUUMO_BASE = (
@@ -108,7 +124,7 @@ def scrape_suumo() -> list:
     while page <= 20:
         url = SUUMO_BASE + f"&pn={page}"
         try:
-            r = session.get(url, timeout=20)
+            r = scraper_get(session, url, timeout=30)
             r.raise_for_status()
             r.encoding = r.apparent_encoding or "utf-8"
         except Exception as e:
@@ -207,7 +223,7 @@ def scrape_homes() -> list:
     while page <= 20:
         url = HOMES_BASE + f"&page={page}"
         try:
-            r = session.get(url, timeout=20)
+            r = scraper_get(session, url, timeout=30)
             r.raise_for_status()
             r.encoding = r.apparent_encoding or "utf-8"
         except Exception as e:
@@ -325,7 +341,7 @@ def scrape_athome() -> list:
     while page <= 20:
         url = ATHOME_BASE + f"&page={page}"
         try:
-            r = session.get(url, timeout=20)
+            r = scraper_get(session, url, timeout=30)
             r.raise_for_status()
             r.encoding = r.apparent_encoding or "utf-8"
         except Exception as e:
