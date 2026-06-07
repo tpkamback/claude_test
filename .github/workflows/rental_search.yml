@@ -1,0 +1,40 @@
+name: 週次賃貸物件検索
+
+on:
+  schedule:
+    - cron: '0 23 * * 0'  # 毎週月曜 8:00 JST
+  workflow_dispatch:       # 手動実行も可能
+
+jobs:
+  search:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - name: チェックアウト
+        uses: actions/checkout@v4
+
+      - name: Python セットアップ
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: 依存パッケージインストール
+        run: pip install -r rental_search/requirements.txt
+
+      - name: 物件検索実行
+        env:
+          GMAIL_USER: ${{ secrets.GMAIL_USER }}
+          GMAIL_APP_PASSWORD: ${{ secrets.GMAIL_APP_PASSWORD }}
+          NOTIFY_EMAIL: ${{ secrets.NOTIFY_EMAIL }}
+        working-directory: rental_search
+        run: python main.py
+
+      - name: seen.json をコミット
+        run: |
+          git config user.name "Claude"
+          git config user.email "noreply@anthropic.com"
+          git add rental_search/seen.json
+          git diff --cached --quiet || git commit -m "chore: update seen listings [skip ci]"
+          git push
